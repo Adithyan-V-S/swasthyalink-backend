@@ -1,14 +1,66 @@
+// Load environment variables
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const { SessionsClient } = require('@google-cloud/dialogflow');
 const path = require('path');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Initialize Firebase Admin
+try {
+  // Prefer env-based credentials in production
+  const hasEnvCreds = !!(process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY);
+  if (hasEnvCreds) {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      }),
+      projectId: process.env.FIREBASE_PROJECT_ID,
+    });
+    console.log('✅ Firebase Admin initialized (env-based)');
+  } else {
+    // Fallback to local credentials in development
+    const serviceAccount = require('./credentialss.json');
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      projectId: serviceAccount.project_id || 'swasthyakink'
+    });
+    console.log('✅ Firebase Admin initialized (local credentials)');
+  }
+} catch (error) {
+  console.error('❌ Failed to initialize Firebase Admin:', error.message);
+  // Continue without Firebase for now to prevent app crash
+  console.log('⚠️ Continuing without Firebase Admin - some features may be limited');
+}
+
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:3000', 
+    'http://localhost:5173', 
+    'http://localhost:5174', 
+    'http://127.0.0.1:5173', 
+    'http://127.0.0.1:5174',
+    'https://swasthyalink-frontend.onrender.com',
+    'https://swasthyalink-frontend-v2.onrender.com'
+  ],
+  credentials: true
+}));
 app.use(express.json());
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
 
 // Dialogflow configuration
 const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID || 'YOUR_PROJECT_ID';
@@ -193,14 +245,14 @@ app.post('/api/gemini', async (req, res) => {
     }
 
 const path = require('path');
-process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(__dirname, 'swasthyalink-468105-143623eabdaa.json');
+process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(__dirname, 'credentialss.json');
 
 const auth = new GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/generative-language'],
 });
 const client = await auth.getClient();
 
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
     const body = {
       contents: [{
@@ -231,8 +283,21 @@ const client = await auth.getClient();
 
     res.json({ success: true, response: generatedText });
   } catch (error) {
-    console.error('Gemini API proxy error:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    // Improved diagnostics for easier debugging
+    const errMsg = error?.message || 'Unknown error';
+    console.error('Gemini API proxy error:', errMsg);
+    if (error?.response) {
+      console.error('Gemini API response status:', error.response.status);
+      console.error('Gemini API response data:', error.response.data);
+    } else if (error?.code) {
+      console.error('Gemini API error code:', error.code);
+    }
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: errMsg,
+      details: error?.response?.data || null,
+    });
   }
 });
 
@@ -249,7 +314,20 @@ const { v4: uuidv4 } = require('uuid');
 
 // In-memory data stores
 const familyRequests = [];
-const familyNetworks = {};
+
+// Firebase Firestore - only initialize if Firebase Admin is available
+let db = null;
+let arrayUnion = null;
+let serverTimestamp = null;
+
+if (admin.apps.length > 0) {
+  db = admin.firestore();
+  arrayUnion = admin.firestore.FieldValue.arrayUnion;
+  serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
+} else {
+  console.log('⚠️ Firebase Firestore not available - using in-memory storage');
+}
+
 const mockUsers = [
   { 
     email: 'john.doe@example.com', 
@@ -371,10 +449,10 @@ app.get('/api/users/search/advanced', (req, res) => {
 });
 
 // API to send family request
-app.post('/api/family/request', (req, res) => {
-  const { fromEmail, toEmail, toName, relationship } = req.body;
+app.post('/api/family/request', async (req, res) => {
+  const { fromUid, fromEmail, toUid, toEmail, toName, relationship } = req.body;
 
-  if (!fromEmail || (!toEmail && !toName) || !relationship) {
+  if (!fromUid || !fromEmail || (!toEmail && !toName) || !relationship) {
     return res.status(400).json({ success: false, error: 'Missing required fields' });
   }
 
@@ -390,18 +468,29 @@ app.post('/api/family/request', (req, res) => {
     return res.status(409).json({ success: false, error: 'Request already pending' });
   }
 
-  // Check if already family
-  const existingFamily = familyNetworks[fromEmail]?.some(member => 
-    member.email === toEmail || member.email === toName
-  );
+  // Check if already family in Firestore
+  try {
+    const fromNetworkRef = doc(db, 'familyNetworks', fromUid);
+    const fromNetworkSnap = await getDoc(fromNetworkRef);
+    const fromMembers = fromNetworkSnap.exists() ? fromNetworkSnap.data().members || [] : [];
+    const alreadyFamily = fromMembers.some(member => 
+      (member.email && member.email === toEmail) || 
+      (member.uid && member.uid === toUid)
+    );
 
-  if (existingFamily) {
-    return res.status(409).json({ success: false, error: 'Already in family network' });
+    if (alreadyFamily) {
+      return res.status(409).json({ success: false, error: 'Already in family network' });
+    }
+  } catch (error) {
+    console.error('Error checking family network:', error);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 
   const newRequest = {
     id: uuidv4(),
+    fromUid,
     fromEmail,
+    toUid: toUid || null,
     toEmail,
     toName,
     relationship,
@@ -414,8 +503,7 @@ app.post('/api/family/request', (req, res) => {
   res.json({ success: true, request: newRequest });
 });
 
-// API to accept family request
-app.post('/api/family/request/:id/accept', (req, res) => {
+app.post('/api/family/request/:id/accept', async (req, res) => {
   const { id } = req.params;
   const request = familyRequests.find(r => r.id === id);
 
@@ -430,29 +518,83 @@ app.post('/api/family/request/:id/accept', (req, res) => {
   request.status = 'accepted';
   request.respondedAt = new Date().toISOString();
 
-  // Add to family network for both parties
-  if (!familyNetworks[request.fromEmail]) {
-    familyNetworks[request.fromEmail] = [];
-  }
-  if (!familyNetworks[request.toEmail]) {
-    familyNetworks[request.toEmail] = [];
-  }
+  try {
+    // Add to family network for both parties in Firestore
+    const fromNetworkRef = doc(db, 'familyNetworks', request.fromUid);
+    const toNetworkRef = doc(db, 'familyNetworks', request.toUid);
 
-  familyNetworks[request.fromEmail].push({
-    email: request.toEmail || request.toName,
-    name: mockUsers.find(u => u.email === request.toEmail)?.name || request.toName,
-    relationship: request.relationship,
-    status: 'accepted',
-    addedAt: new Date().toISOString()
-  });
+    const fromMember = {
+      uid: request.toUid,
+      email: request.toEmail || null,
+      name: mockUsers.find(u => u.email === request.toEmail)?.name || request.toName || null,
+      relationship: request.relationship,
+      status: 'accepted',
+      addedAt: serverTimestamp()
+    };
 
-  familyNetworks[request.toEmail].push({
-    email: request.fromEmail,
-    name: mockUsers.find(u => u.email === request.fromEmail)?.name || request.fromEmail,
-    relationship: getInverseRelationship(request.relationship),
-    status: 'accepted',
-    addedAt: new Date().toISOString()
-  });
+    const toMember = {
+      uid: request.fromUid,
+      email: request.fromEmail,
+      name: mockUsers.find(u => u.email === request.fromEmail)?.name || request.fromEmail,
+      relationship: getInverseRelationship(request.relationship),
+      status: 'accepted',
+      addedAt: serverTimestamp()
+    };
+
+    // Check if member already exists before adding
+    const fromNetworkDoc = await getDoc(fromNetworkRef);
+    const fromExistingMembers = fromNetworkDoc.exists() ? fromNetworkDoc.data().members || [] : [];
+    const fromMemberExists = fromExistingMembers.some(member => 
+      (member.email && member.email === fromMember.email) || 
+      (member.uid && member.uid === fromMember.uid)
+    );
+
+    if (!fromMemberExists) {
+      await updateDoc(fromNetworkRef, {
+        members: arrayUnion(fromMember),
+        updatedAt: serverTimestamp()
+      }).catch(async (error) => {
+        if (error.code === 5) { // NOT_FOUND
+          await setDoc(fromNetworkRef, {
+            members: [fromMember],
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        } else {
+          throw error;
+        }
+      });
+    }
+
+    // Check if member already exists before adding
+    const toNetworkDoc = await getDoc(toNetworkRef);
+    const toExistingMembers = toNetworkDoc.exists() ? toNetworkDoc.data().members || [] : [];
+    const toMemberExists = toExistingMembers.some(member => 
+      (member.email && member.email === toMember.email) || 
+      (member.uid && member.uid === toMember.uid)
+    );
+
+    if (!toMemberExists) {
+      await updateDoc(toNetworkRef, {
+        members: arrayUnion(toMember),
+        updatedAt: serverTimestamp()
+      }).catch(async (error) => {
+        if (error.code === 5) { // NOT_FOUND
+          await setDoc(toNetworkRef, {
+            members: [toMember],
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        } else {
+          throw error;
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error updating family network in Firestore:', error);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 
   res.json({ success: true, request });
 });
@@ -476,17 +618,182 @@ app.post('/api/family/request/:id/reject', (req, res) => {
   res.json({ success: true, request });
 });
 
-// API to get family network for an email
-app.get('/api/family/network', (req, res) => {
-  const { email } = req.query;
+// API to cleanup duplicate family members
+app.post('/api/family/cleanup-duplicates', async (req, res) => {
+  try {
+    const { cleanupDuplicateFamilyMembers } = require('./cleanup-duplicate-family-members');
+    await cleanupDuplicateFamilyMembers();
+    res.json({ success: true, message: 'Duplicate family members cleaned up successfully' });
+  } catch (error) {
+    console.error('Error cleaning up duplicates:', error);
+    res.status(500).json({ success: false, error: 'Failed to cleanup duplicates' });
+  }
+});
 
-  if (!email) {
-    return res.status(400).json({ success: false, error: 'Email query parameter is required' });
+// API to migrate family connections (ensure bidirectional)
+app.post('/api/family/migrate-connections', async (req, res) => {
+  try {
+    console.log('🔄 Starting family connections migration...');
+    
+    // Get all family network documents
+    const familyNetworksSnapshot = await db.collection('familyNetworks').get();
+    
+    if (familyNetworksSnapshot.empty) {
+      return res.json({ success: true, message: 'No family networks found', updatesCount: 0 });
+    }
+    
+    console.log(`📊 Found ${familyNetworksSnapshot.size} family network documents`);
+    
+    const batch = db.batch();
+    let updatesCount = 0;
+    
+    // Process each family network
+    for (const docSnapshot of familyNetworksSnapshot.docs) {
+      const userUid = docSnapshot.id;
+      const networkData = docSnapshot.data();
+      const members = networkData.members || [];
+      
+      console.log(`👤 Processing user ${userUid} with ${members.length} members`);
+      
+      // For each member in this user's network
+      for (const member of members) {
+        if (!member.uid) {
+          console.warn(`⚠️ Member without UID found for user ${userUid}:`, member);
+          continue;
+        }
+        
+        // Check if the reverse connection exists
+        const reverseNetworkRef = db.collection('familyNetworks').doc(member.uid);
+        const reverseNetworkDoc = await reverseNetworkRef.get();
+        
+        if (!reverseNetworkDoc.exists) {
+          // Create the reverse network document
+          console.log(`➕ Creating reverse network for ${member.uid}`);
+          
+          // Get user data for the reverse member
+          const userDoc = await db.collection('users').doc(userUid).get();
+          const userData = userDoc.exists ? userDoc.data() : {};
+          
+          const reverseMember = {
+            uid: userUid,
+            email: userData.email || networkData.userEmail || 'unknown@example.com',
+            name: userData.displayName || userData.name || networkData.userName || 'Unknown User',
+            relationship: getInverseRelationship(member.relationship),
+            accessLevel: member.accessLevel || 'limited',
+            isEmergencyContact: member.isEmergencyContact || false,
+            addedAt: member.addedAt || new Date().toISOString(),
+            status: 'accepted'
+          };
+          
+          batch.set(reverseNetworkRef, {
+            userUid: member.uid,
+            members: [reverseMember],
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+          
+          updatesCount++;
+        } else {
+          // Check if the reverse member exists in the reverse network
+          const reverseNetworkData = reverseNetworkDoc.data();
+          const reverseMembers = reverseNetworkData.members || [];
+          
+          const reverseMemberExists = reverseMembers.some(m => m.uid === userUid);
+          
+          if (!reverseMemberExists) {
+            console.log(`🔄 Adding missing reverse member for ${member.uid}`);
+            
+            // Get user data for the reverse member
+            const userDoc = await db.collection('users').doc(userUid).get();
+            const userData = userDoc.exists ? userDoc.data() : {};
+            
+            const reverseMember = {
+              uid: userUid,
+              email: userData.email || networkData.userEmail || 'unknown@example.com',
+              name: userData.displayName || userData.name || networkData.userName || 'Unknown User',
+              relationship: getInverseRelationship(member.relationship),
+              accessLevel: member.accessLevel || 'limited',
+              isEmergencyContact: member.isEmergencyContact || false,
+              addedAt: member.addedAt || new Date().toISOString(),
+              status: 'accepted'
+            };
+            
+            batch.update(reverseNetworkRef, {
+              members: arrayUnion(reverseMember),
+              updatedAt: serverTimestamp()
+            });
+            
+            updatesCount++;
+          }
+        }
+      }
+    }
+    
+    // Commit all updates
+    if (updatesCount > 0) {
+      console.log(`💾 Committing ${updatesCount} updates...`);
+      await batch.commit();
+      console.log('✅ Migration completed successfully!');
+    } else {
+      console.log('✨ No updates needed - all connections are already bidirectional');
+    }
+    
+    res.json({ 
+      success: true, 
+      message: `Migration completed. ${updatesCount} connections updated.`,
+      updatesCount 
+    });
+    
+  } catch (error) {
+    console.error('❌ Migration failed:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Helper function to get inverse relationship
+function getInverseRelationship(relationship) {
+  const inverseMap = {
+    'Parent': 'Child',
+    'Child': 'Parent',
+    'Spouse': 'Spouse',
+    'Sibling': 'Sibling',
+    'Grandparent': 'Grandchild',
+    'Grandchild': 'Grandparent',
+    'Uncle': 'Nephew/Niece',
+    'Aunt': 'Nephew/Niece',
+    'Cousin': 'Cousin',
+    'Friend': 'Friend',
+    'Caregiver': 'Patient',
+    'Patient': 'Caregiver'
+  };
+  
+  return inverseMap[relationship] || relationship;
+}
+
+// API to get family network for an email or UID from Firestore
+app.get('/api/family/network', async (req, res) => {
+  const { uid } = req.query;
+
+  if (!uid) {
+    return res.status(400).json({ success: false, error: 'UID query parameter is required' });
   }
 
-  const network = familyNetworks[email] || [];
+  try {
+    const networkRef = doc(db, 'familyNetworks', uid);
+    const networkSnap = await getDoc(networkRef);
 
-  res.json({ success: true, network });
+    if (!networkSnap.exists()) {
+      return res.json({ success: true, network: [] });
+    }
+
+    const data = networkSnap.data();
+    const members = data.members || [];
+
+    res.json({ success: true, network: members });
+  } catch (error) {
+    console.error('Error fetching family network from Firestore:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
 
 // API to get pending requests for a user
@@ -528,39 +835,595 @@ function getInverseRelationship(relationship) {
 }
 
 // API to get both families when relationship is accepted
-app.get('/api/family/mutual-network', (req, res) => {
-  const { email1, email2 } = req.query;
+app.get('/api/family/mutual-network', async (req, res) => {
+  const { uid1, uid2 } = req.query;
 
-  if (!email1 || !email2) {
-    return res.status(400).json({ success: false, error: 'Both email1 and email2 are required' });
+  if (!uid1 || !uid2) {
+    return res.status(400).json({ success: false, error: 'Both uid1 and uid2 are required' });
   }
 
-  const network1 = familyNetworks[email1] || [];
-  const network2 = familyNetworks[email2] || [];
+  try {
+    // Fetch family networks from Firestore for both users
+    const [network1Snap, network2Snap] = await Promise.all([
+      getDoc(doc(db, 'familyNetworks', uid1)),
+      getDoc(doc(db, 'familyNetworks', uid2))
+    ]);
 
-  // Find the relationship between email1 and email2
-  const relationship1 = network1.find(member => member.email === email2);
-  const relationship2 = network2.find(member => member.email === email1);
+    const network1 = network1Snap.exists() ? network1Snap.data().members || [] : [];
+    const network2 = network2Snap.exists() ? network2Snap.data().members || [] : [];
 
-  res.json({ 
-    success: true, 
-    user1: {
-      email: email1,
-      family: network1
-    },
-    user2: {
-      email: email2,
-      family: network2
-    },
-    relationship: relationship1 || relationship2
-  });
+    // Find the relationship between uid1 and uid2
+    const relationship1 = network1.find(member => member.uid === uid2);
+    const relationship2 = network2.find(member => member.uid === uid1);
+
+    res.json({
+      success: true,
+      user1: {
+        uid: uid1,
+        family: network1
+      },
+      user2: {
+        uid: uid2,
+        family: network2
+      },
+      relationship: relationship1 || relationship2
+    });
+  } catch (error) {
+    console.error('Error fetching mutual family networks from Firestore:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
+
+// Import and use notification routes
+const notificationRoutes = require('./routes/notifications');
+app.use('/api/notifications', notificationRoutes);
+
+// Import and use presence routes
+const presenceRoutes = require('./routes/presence');
+app.use('/api/presence', presenceRoutes);
+
+// Import and use patient-doctor relationship routes
+const patientDoctorRoutes = require('./routes/patientDoctor');
+app.use('/api/patient-doctor', patientDoctorRoutes);
+
+// Import and use OTP routes
+const otpRoutes = require('./routes/otp');
+app.use('/api/otp', otpRoutes);
+
+// Import and use prescription routes
+const prescriptionRoutes = require('./routes/prescriptions');
+app.use('/api/prescriptions', prescriptionRoutes);
+
+// Import doctor model and auth middleware
+const DoctorModel = require('./src/models/doctorModel');
+const { requireAdmin, requireDoctor } = require('./src/middleware/auth');
+
+// Admin Login API
+app.post('/api/admin/login', (req, res) => {
+  try {
+    const { name, password } = req.body;
+
+    if (!name || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Name and password are required'
+      });
+    }
+
+    // Check preset admin credentials
+    if (name === 'admin' && password === 'admin123') {
+      return res.json({
+        success: true,
+        message: 'Admin login successful',
+        admin: {
+          id: 'preset-admin',
+          name: 'admin',
+          role: 'admin'
+        }
+      });
+    } else {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid admin credentials'
+      });
+    }
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Doctor Management APIs
+
+
+
+// API to get pending doctor registrations (Admin only)
+app.get('/api/admin/doctors/registrations', requireAdmin, async (req, res) => {
+  try {
+    const result = await DoctorModel.getPendingRegistrations();
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching registrations:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch registrations'
+    });
+  }
+});
+
+// API to approve doctor registration (Admin only)
+app.post('/api/admin/doctors/approve/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { loginId, password } = req.body;
+
+    if (!loginId || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Login ID and password are required'
+      });
+    }
+
+    const result = await DoctorModel.approveRegistration(id, {
+      loginId,
+      password,
+      adminId: req.admin.id
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error approving registration:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to approve registration'
+    });
+  }
+});
+
+// API to reject doctor registration (Admin only)
+app.post('/api/admin/doctors/reject/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await DoctorModel.rejectRegistration(id, req.admin.id);
+    res.json(result);
+  } catch (error) {
+    console.error('Error rejecting registration:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to reject registration'
+    });
+  }
+});
+
+// API to get all doctor accounts (Admin only)
+app.get('/api/admin/doctors', requireAdmin, async (req, res) => {
+  try {
+    const result = await DoctorModel.getAllDoctors();
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching doctors:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch doctors'
+    });
+  }
+});
+
+// API to get doctor statistics (Admin only)
+app.get('/api/admin/doctors/stats', requireAdmin, async (req, res) => {
+  try {
+    const result = await DoctorModel.getDoctorStatistics();
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching doctor statistics:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch statistics'
+    });
+  }
+});
+
+// API to get all patients (Admin only)
+app.get('/api/admin/patients', requireAdmin, async (req, res) => {
+  try {
+    const result = await DoctorModel.getAllPatients();
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching patients:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch patients'
+    });
+  }
+});
+
+// API to update doctor account (Admin only)
+app.put('/api/admin/doctors/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    const result = await DoctorModel.updateDoctorProfile(id, updates);
+    res.json(result);
+  } catch (error) {
+    console.error('Error updating doctor:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update doctor'
+    });
+  }
+});
+
+// API to update doctor status (Admin only)
+app.post('/api/admin/doctors/:id/status', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body; // 'active' or 'suspended'
+
+    if (!['active', 'suspended'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid status. Must be "active" or "suspended"'
+      });
+    }
+
+    const result = await DoctorModel.updateDoctorStatus(id, status, req.admin.id);
+    res.json(result);
+  } catch (error) {
+    console.error('Error updating doctor status:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update doctor status'
+    });
+  }
+});
+
+// API to disable doctor account (Admin only)
+app.post('/api/admin/doctors/:id/disable', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await DoctorModel.disableDoctor(id, req.admin.id);
+    res.json(result);
+  } catch (error) {
+    console.error('Error disabling doctor:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to disable doctor'
+    });
+  }
+});
+
+// Doctor authentication
+app.post('/api/doctors/login', async (req, res) => {
+  try {
+    const { loginId, password } = req.body;
+
+    if (!loginId || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Login ID and password are required'
+      });
+    }
+
+    const result = await DoctorModel.authenticateDoctor(loginId, password);
+    res.json(result);
+  } catch (error) {
+    console.error('Doctor authentication error:', error);
+    res.status(401).json({
+      success: false,
+      error: error.message || 'Authentication failed'
+    });
+  }
+});
+
+// Doctor profile update (requires authentication)
+app.put('/api/doctors/profile', requireDoctor, async (req, res) => {
+  try {
+    const updates = req.body;
+
+    // Remove sensitive fields from updates
+    delete updates.password;
+    delete updates.loginId;
+    delete updates.sessionToken;
+    delete updates.role;
+
+    const result = await DoctorModel.updateDoctorProfile(req.doctor.id, updates);
+    res.json(result);
+  } catch (error) {
+    console.error('Error updating doctor profile:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update profile'
+    });
+  }
+});
+
+// Get doctor profile (requires authentication)
+app.get('/api/doctors/profile', requireDoctor, async (req, res) => {
+  try {
+    const result = await DoctorModel.getDoctorById(req.doctor.id);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching doctor profile:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch profile'
+    });
+  }
+});
+
+// Import ML services
+const PredictiveAnalyticsService = require('./src/services/ml/predictiveAnalytics');
+const HealthRiskModel = require('./src/models/healthRiskModel');
+const MLHelpers = require('./src/utils/mlHelpers');
+
+
+
+// ML API Endpoints
+
+// Health Risk Assessment Endpoint
+app.post('/api/ml/health-risk-assessment', async (req, res) => {
+  try {
+    const healthData = req.body;
+
+    if (!healthData || Object.keys(healthData).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Health data is required'
+      });
+    }
+
+    // Validate and normalize health data
+    const validation = MLHelpers.validateHealthData(healthData);
+    if (!validation.isValid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        details: validation
+      });
+    }
+
+    const normalizedData = MLHelpers.normalizeHealthData(healthData);
+
+    // Calculate health risk using predictive analytics
+    const riskAssessment = await PredictiveAnalyticsService.calculateHealthRisk(normalizedData);
+
+    // Calculate health score
+    const healthScore = MLHelpers.calculateHealthScore(normalizedData);
+
+    // Generate health insights
+    const insights = MLHelpers.generateHealthInsights(normalizedData);
+
+    // Generate statistical summary if multiple data points provided
+    let stats = null;
+    if (Array.isArray(healthData)) {
+      stats = MLHelpers.generateHealthStats(healthData);
+    }
+
+    res.json({
+      success: true,
+      riskAssessment,
+      healthScore,
+      insights,
+      stats,
+      dataQuality: validation,
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Health risk assessment error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error during health risk assessment'
+    });
+  }
+});
+
+// Predictive Health Trends Endpoint
+app.post('/api/ml/health-trends', async (req, res) => {
+  try {
+    const { historicalData, userId } = req.body;
+
+    if (!historicalData || !Array.isArray(historicalData) || historicalData.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Historical health data is required'
+      });
+    }
+
+    const trends = await PredictiveAnalyticsService.predictHealthTrends(historicalData);
+
+    res.json({
+      success: true,
+      trends,
+      userId,
+      dataPoints: historicalData.length,
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Health trends prediction error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error during health trends prediction'
+    });
+  }
+});
+
+// Disease Risk Prediction Endpoint
+app.post('/api/ml/disease-risk/:diseaseType', async (req, res) => {
+  try {
+    const { diseaseType } = req.params;
+    const healthData = req.body;
+
+    if (!healthData || Object.keys(healthData).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Health data is required'
+      });
+    }
+
+    const normalizedData = MLHelpers.normalizeHealthData(healthData);
+
+    // Predict disease-specific risk
+    const riskScore = HealthRiskModel.predictDiseaseRisk(diseaseType, normalizedData);
+    const interpretation = HealthRiskModel.getRiskInterpretation(riskScore);
+
+    res.json({
+      success: true,
+      diseaseType,
+      riskScore,
+      interpretation,
+      factors: normalizedData,
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Disease risk prediction error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error during disease risk prediction'
+    });
+  }
+});
+
+// Health Statistics Endpoint
+app.post('/api/ml/health-stats', async (req, res) => {
+  try {
+    const { dataPoints, metrics } = req.body;
+
+    if (!dataPoints || !Array.isArray(dataPoints) || dataPoints.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Health data points are required'
+      });
+    }
+
+    const stats = MLHelpers.generateHealthStats(dataPoints);
+
+    // Filter stats by requested metrics if provided
+    let filteredStats = stats;
+    if (metrics && Array.isArray(metrics)) {
+      filteredStats = {};
+      metrics.forEach(metric => {
+        if (stats[metric]) {
+          filteredStats[metric] = stats[metric];
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      stats: filteredStats,
+      totalDataPoints: dataPoints.length,
+      metricsAnalyzed: Object.keys(filteredStats).length,
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Health statistics error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error during health statistics generation'
+    });
+  }
+});
+
+// Personalized Health Recommendations Endpoint
+app.post('/api/ml/health-recommendations', async (req, res) => {
+  try {
+    const healthData = req.body;
+
+    if (!healthData || Object.keys(healthData).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Health data is required'
+      });
+    }
+
+    const normalizedData = MLHelpers.normalizeHealthData(healthData);
+    const riskAssessment = await PredictiveAnalyticsService.calculateHealthRisk(normalizedData);
+    const insights = MLHelpers.generateHealthInsights(normalizedData);
+
+    // Generate personalized recommendations based on risk factors
+    const recommendations = {
+      immediate: riskAssessment.recommendations?.immediate || [],
+      shortTerm: riskAssessment.recommendations?.shortTerm || [],
+      longTerm: riskAssessment.recommendations?.longTerm || [],
+      lifestyle: riskAssessment.recommendations?.lifestyle || [],
+      custom: insights
+    };
+
+    res.json({
+      success: true,
+      recommendations,
+      basedOn: {
+        riskLevel: riskAssessment.overallRisk?.level,
+        dataCompleteness: riskAssessment.dataCompleteness
+      },
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Health recommendations error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error during health recommendations generation'
+    });
+  }
+});
+
+// Health Data Validation Endpoint
+app.post('/api/ml/validate-health-data', async (req, res) => {
+  try {
+    const healthData = req.body;
+
+    if (!healthData || Object.keys(healthData).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Health data is required'
+      });
+    }
+
+    const validation = MLHelpers.validateHealthData(healthData);
+    const normalizedData = MLHelpers.normalizeHealthData(healthData);
+    const healthScore = MLHelpers.calculateHealthScore(normalizedData);
+
+    res.json({
+      success: true,
+      validation,
+      normalizedData,
+      healthScore,
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Health data validation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error during health data validation'
+    });
+  }
+});
+
+// Admin Routes
+const adminRoutes = require('./routes/admin');
+app.use('/api/admin', adminRoutes);
+
+// Doctor Routes
+const doctorRoutes = require('./routes/doctor');
+app.use('/api/doctors', doctorRoutes);
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Backend server running on port ${PORT}`);
   console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
   console.log(`💬 Chatbot endpoint: http://localhost:${PORT}/api/chatbot`);
+  console.log(`👨‍⚕️ Admin endpoints: http://localhost:${PORT}/api/admin`);
+  console.log(`👨‍⚕️ Doctor endpoints: http://localhost:${PORT}/api/doctors`);
 });
 
 module.exports = app;

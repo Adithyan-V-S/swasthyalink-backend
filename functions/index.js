@@ -33,6 +33,8 @@ exports.onFamilyRequestCreate = functions.firestore
   });
 
 // Trigger on new family chat message creation
+const chatNotificationTimestamps = new Map();
+
 exports.onFamilyChatCreate = functions.firestore
   .document('familyChats/{chatId}/messages/{messageId}')
   .onCreate(async (snap, context) => {
@@ -44,6 +46,15 @@ exports.onFamilyChatCreate = functions.firestore
 
     const lastSenderId = message.lastSenderId;
     const participantInfo = message.participantInfo || {};
+
+    // Rate limiting: allow notifications per chatId only once every 10 seconds
+    const now = Date.now();
+    const lastNotified = chatNotificationTimestamps.get(chatId) || 0;
+    if (now - lastNotified < 10000) {
+      console.log(`Skipping notifications for chat ${chatId} due to rate limiting.`);
+      return null;
+    }
+    chatNotificationTimestamps.set(chatId, now);
 
     const notifications = [];
 
