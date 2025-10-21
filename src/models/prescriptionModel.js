@@ -83,7 +83,6 @@ class PrescriptionModel {
 
       const prescriptionsSnap = await db.collection('prescriptions')
         .where('doctorId', '==', doctorId)
-        .orderBy('createdAt', 'desc')
         .limit(limit)
         .get();
 
@@ -131,7 +130,6 @@ class PrescriptionModel {
 
       const prescriptionsSnap = await db.collection('prescriptions')
         .where('patientId', '==', patientId)
-        .orderBy('createdAt', 'desc')
         .limit(limit)
         .get();
 

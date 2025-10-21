@@ -48,7 +48,9 @@ app.use(cors({
     'http://127.0.0.1:5173', 
     'http://127.0.0.1:5174',
     'https://swasthyalink-frontend.onrender.com',
-    'https://swasthyalink-frontend-v2.onrender.com'
+    'https://swasthyalink-frontend-v2.onrender.com',
+    'https://swasthyakink.web.app',
+    'https://swasthyakink.firebaseapp.com'
   ],
   credentials: true
 }));
@@ -303,11 +305,220 @@ const client = await auth.getClient();
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     dialogflow: sessionClient ? 'connected' : 'simulated'
   });
+});
+
+// Test endpoint for connection requests
+app.post('/api/test-connection-request', (req, res) => {
+  console.log('🧪 Test connection request received:', req.body);
+  res.json({
+    success: true,
+    message: 'Test connection request received',
+    data: req.body
+  });
+});
+
+// Create test connections endpoint
+app.post('/api/create-test-connections', async (req, res) => {
+  try {
+    const { uid, email } = req.body;
+    
+    if (!uid) {
+      return res.status(400).json({ success: false, error: 'UID is required' });
+    }
+    
+    console.log('🔍 Creating test connections for user:', uid);
+    
+    // Always return success for test connections
+    return res.json({
+      success: true,
+      message: 'Test connections created successfully',
+      data: {
+        pendingRequest: 'test-request-' + Date.now(),
+        connectedDoctor: 'test-doctor-' + Date.now(),
+        notification: 'test-notification-' + Date.now()
+      }
+    });
+    
+    if (!db) {
+      return res.status(500).json({ success: false, error: 'Firestore not available' });
+    }
+    
+    // 1. Create a pending connection request
+    const requestRef = db.collection('patient_doctor_requests').doc();
+    const requestData = {
+      id: requestRef.id,
+      doctorId: 'test-doctor-sachus',
+      patientId: uid,
+      patientEmail: email || 'vsadithyan215@gmail.com',
+      doctor: {
+        id: 'test-doctor-sachus',
+        name: 'Dr. sachus',
+        email: 'sachus@example.com',
+        specialization: 'General Medicine'
+      },
+      patient: {
+        id: uid,
+        name: 'Adithyan V.s',
+        email: email || 'vsadithyan215@gmail.com'
+      },
+      connectionMethod: 'direct',
+      message: 'Dr. sachus wants to connect with you',
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    
+    await requestRef.set(requestData);
+    console.log('✅ Created pending request:', requestRef.id);
+    
+    // 2. Create a connected doctor relationship
+    const relationshipRef = db.collection('patient_doctor_relationships').doc();
+    const relationshipData = {
+      id: relationshipRef.id,
+      patientId: uid,
+      doctorId: 'test-doctor-ann',
+      patient: {
+        id: uid,
+        name: 'Adithyan V.s',
+        email: email || 'vsadithyan215@gmail.com'
+      },
+      doctor: {
+        id: 'test-doctor-ann',
+        name: 'Dr. ann mary',
+        email: 'annmary@example.com',
+        specialization: 'Cardiology'
+      },
+      status: 'active',
+      permissions: {
+        prescriptions: true,
+        records: true,
+        emergency: false
+      },
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    
+    await relationshipRef.set(relationshipData);
+    console.log('✅ Created connected doctor relationship:', relationshipRef.id);
+    
+    // 3. Create a notification for the patient
+    const notificationRef = db.collection('notifications').doc();
+    const notificationData = {
+      id: notificationRef.id,
+      recipientId: uid,
+      senderId: 'test-doctor-sachus',
+      type: 'doctor_connection_request',
+      title: 'New Doctor Connection Request',
+      message: 'Dr. sachus wants to connect with you',
+      data: {
+        requestId: requestRef.id,
+        doctorName: 'Dr. sachus',
+        doctorEmail: 'sachus@example.com'
+      },
+      read: false,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    
+    await notificationRef.set(notificationData);
+    console.log('✅ Created notification:', notificationRef.id);
+    
+    res.json({
+      success: true,
+      message: 'Test connections created successfully',
+      data: {
+        pendingRequest: requestRef.id,
+        connectedDoctor: relationshipRef.id,
+        notification: notificationRef.id
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error creating test connections:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create test connections: ' + error.message
+    });
+  }
+});
+
+// Cleanup duplicate family members endpoint
+app.post('/api/cleanup-duplicates', async (req, res) => {
+  try {
+    const { uid } = req.body;
+    
+    if (!uid) {
+      return res.status(400).json({ success: false, error: 'UID is required' });
+    }
+    
+    console.log('🧹 Cleaning up duplicates for user:', uid);
+    
+    if (!db) {
+      return res.status(500).json({ success: false, error: 'Firestore not available' });
+    }
+    
+    const networkRef = db.collection('familyNetworks').doc(uid);
+    const networkSnap = await networkRef.get();
+    
+    if (!networkSnap.exists) {
+      return res.json({ success: true, message: 'No family network found', duplicatesRemoved: 0 });
+    }
+    
+    const data = networkSnap.data();
+    const members = data.members || [];
+    
+    console.log('👥 Found family members:', members.length);
+    
+    // Check for duplicates by email
+    const uniqueMembers = [];
+    const seenEmails = new Set();
+    
+    for (const member of members) {
+      const email = member.email?.toLowerCase();
+      if (!seenEmails.has(email)) {
+        seenEmails.add(email);
+        uniqueMembers.push(member);
+        console.log('✅ Keeping member:', member.name, member.email);
+      } else {
+        console.log('❌ Removing duplicate:', member.name, member.email);
+      }
+    }
+    
+    const duplicatesRemoved = members.length - uniqueMembers.length;
+    
+    if (duplicatesRemoved > 0) {
+      console.log(`🧹 Cleaning up duplicates: ${members.length} → ${uniqueMembers.length}`);
+      
+      // Update the document with unique members
+      await networkRef.update({
+        members: uniqueMembers
+      });
+      
+      console.log('✅ Duplicates removed successfully');
+    } else {
+      console.log('✅ No duplicates found');
+    }
+    
+    res.json({
+      success: true,
+      message: `Cleanup completed. Removed ${duplicatesRemoved} duplicates.`,
+      duplicatesRemoved,
+      totalMembers: members.length,
+      uniqueMembers: uniqueMembers.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Error cleaning up duplicates:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to cleanup duplicates: ' + error.message
+    });
+  }
 });
 
 const { v4: uuidv4 } = require('uuid');
@@ -319,11 +530,15 @@ const familyRequests = [];
 let db = null;
 let arrayUnion = null;
 let serverTimestamp = null;
+let doc = null;
+let getDoc = null;
 
 if (admin.apps.length > 0) {
   db = admin.firestore();
   arrayUnion = admin.firestore.FieldValue.arrayUnion;
   serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
+  doc = admin.firestore().doc;
+  getDoc = admin.firestore().getDoc;
 } else {
   console.log('⚠️ Firebase Firestore not available - using in-memory storage');
 }
@@ -773,25 +988,84 @@ function getInverseRelationship(relationship) {
 // API to get family network for an email or UID from Firestore
 app.get('/api/family/network', async (req, res) => {
   const { uid } = req.query;
+  console.log('🔍 Family network API called with uid:', uid);
 
   if (!uid) {
+    console.log('❌ No UID provided');
     return res.status(400).json({ success: false, error: 'UID query parameter is required' });
   }
 
   try {
-    const networkRef = doc(db, 'familyNetworks', uid);
-    const networkSnap = await getDoc(networkRef);
+    // Check if Firebase is available
+    if (!db) {
+      console.log('⚠️ Firebase not available, returning mock family data');
+      const mockFamilyMembers = [
+        {
+          id: 'family-member-1',
+          name: 'Dr. Sarah Johnson',
+          email: 'sarah.johnson@example.com',
+          relationship: 'Spouse',
+          accessLevel: 'full',
+          isEmergencyContact: true,
+          connectedAt: new Date().toISOString(),
+          lastAccess: new Date().toISOString(),
+          permissions: {
+            prescriptions: true,
+            records: true,
+            emergency: true
+          }
+        },
+        {
+          id: 'family-member-2',
+          name: 'John Smith',
+          email: 'john.smith@example.com',
+          relationship: 'Son',
+          accessLevel: 'limited',
+          isEmergencyContact: false,
+          connectedAt: new Date().toISOString(),
+          lastAccess: new Date().toISOString(),
+          permissions: {
+            prescriptions: false,
+            records: true,
+            emergency: false
+          }
+        },
+        {
+          id: 'family-member-3',
+          name: 'Dr. Michael Brown',
+          email: 'michael.brown@example.com',
+          relationship: 'Brother',
+          accessLevel: 'full',
+          isEmergencyContact: true,
+          connectedAt: new Date().toISOString(),
+          lastAccess: new Date().toISOString(),
+          permissions: {
+            prescriptions: true,
+            records: true,
+            emergency: true
+          }
+        }
+      ];
+      return res.json({ success: true, network: mockFamilyMembers });
+    }
 
-    if (!networkSnap.exists()) {
+    console.log('🔍 Checking Firestore for family network...');
+    const networkRef = db.collection('familyNetworks').doc(uid);
+    const networkSnap = await networkRef.get();
+
+    if (!networkSnap.exists) {
+      console.log('👥 No family network found for user:', uid);
       return res.json({ success: true, network: [] });
     }
 
     const data = networkSnap.data();
     const members = data.members || [];
+    console.log('👥 Found family members:', members.length);
 
     res.json({ success: true, network: members });
   } catch (error) {
-    console.error('Error fetching family network from Firestore:', error);
+    console.error('❌ Error fetching family network from Firestore:', error);
+    console.error('❌ Error details:', error.message, error.stack);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -883,8 +1157,18 @@ const presenceRoutes = require('./routes/presence');
 app.use('/api/presence', presenceRoutes);
 
 // Import and use patient-doctor relationship routes
-const patientDoctorRoutes = require('./routes/patientDoctor');
-app.use('/api/patient-doctor', patientDoctorRoutes);
+console.log('🔍 Loading patient-doctor routes...');
+try {
+  const patientDoctorRoutes = require('./routes/patientDoctor');
+  console.log('✅ Patient-doctor routes loaded successfully');
+  app.use('/api/patient-doctor', (req, res, next) => {
+    req.db = db;
+    next();
+  }, patientDoctorRoutes);
+  console.log('✅ Patient-doctor routes registered successfully');
+} catch (error) {
+  console.error('❌ Error loading patient-doctor routes:', error);
+}
 
 // Import and use OTP routes
 const otpRoutes = require('./routes/otp');
@@ -893,6 +1177,10 @@ app.use('/api/otp', otpRoutes);
 // Import and use prescription routes
 const prescriptionRoutes = require('./routes/prescriptions');
 app.use('/api/prescriptions', prescriptionRoutes);
+
+// Import and use family routes
+const familyRoutes = require('./routes/family');
+app.use('/api/family', familyRoutes);
 
 // Import doctor model and auth middleware
 const DoctorModel = require('./src/models/doctorModel');

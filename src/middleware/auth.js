@@ -326,8 +326,10 @@ const requireAuth = async (req, res, next) => {
 const requirePatient = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
+    console.log('🔍 requirePatient: Auth header:', authHeader);
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      console.log('❌ requirePatient: No auth header or invalid format');
       return res.status(401).json({
         success: false,
         error: 'Authorization token required'
@@ -335,9 +337,11 @@ const requirePatient = async (req, res, next) => {
     }
 
     const token = authHeader.substring(7);
+    console.log('🔍 requirePatient: Token:', token.substring(0, 20) + '...');
 
     // Check for test user token first
     if (token === 'test-patient-token' || token === 'test-user-token') {
+      console.log('✅ requirePatient: Test token detected, creating mock user');
       req.user = {
         uid: 'test-patient-uid',
         email: 'patient@swasthyalink.com',
@@ -345,6 +349,7 @@ const requirePatient = async (req, res, next) => {
         name: 'Test Patient',
         status: 'active'
       };
+      console.log('✅ requirePatient: Mock user created:', req.user);
       return next();
     }
 
