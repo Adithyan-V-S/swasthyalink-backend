@@ -118,3 +118,4 @@ async function cleanupDuplicateDoctors() {
 
 // Run the cleanup
 cleanupDuplicateDoctors();
+

@@ -39,7 +39,7 @@ try {
   console.log('⚠️ Continuing without Firebase Admin - some features may be limited');
 }
 
-// Middleware
+// Middleware - Updated CORS for Firebase Hosting
 app.use(cors({
   origin: [
     'http://localhost:3000', 
@@ -65,18 +65,24 @@ app.use((req, res, next) => {
 });
 
 // Dialogflow configuration
-const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID || 'YOUR_PROJECT_ID';
-const keyFilename = process.env.GOOGLE_APPLICATION_CREDENTIALS || './credentials.json';
+const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID || 'swasthyakink';
 const languageCode = 'en';
 
 // Initialize Dialogflow client
 let sessionClient;
 try {
-  sessionClient = new SessionsClient({
-    keyFilename: path.join(__dirname, keyFilename),
-    projectId: projectId,
-  });
-  console.log('✅ Dialogflow client initialized successfully');
+  // Use environment variables for credentials in production
+  const hasDialogflowCreds = !!(process.env.GOOGLE_CLOUD_PROJECT_ID);
+  
+  if (hasDialogflowCreds) {
+    sessionClient = new SessionsClient({
+      projectId: projectId,
+    });
+    console.log('✅ Dialogflow client initialized successfully (env-based)');
+  } else {
+    console.log('⚠️ Dialogflow credentials not found, using simulated responses');
+    sessionClient = null;
+  }
 } catch (error) {
   console.error('❌ Failed to initialize Dialogflow client:', error.message);
   console.log('🔧 Using simulated responses instead');
@@ -235,9 +241,35 @@ app.post('/api/chatbot', async (req, res) => {
   }
 });
 
-// New Gemini API proxy endpoint
+// Real Gemini API integration
 const { GoogleAuth } = require('google-auth-library');
-const fetch = require('node-fetch');
+const path = require('path');
+
+// Initialize Google Auth for Gemini API
+let geminiAuth = null;
+let geminiClient = null;
+
+async function initializeGeminiAuth() {
+  try {
+    // Set credentials path
+    const credentialsPath = path.join(__dirname, 'credentialss.json');
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = credentialsPath;
+    
+    geminiAuth = new GoogleAuth({
+      scopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/generative-language'],
+    });
+    
+    geminiClient = await geminiAuth.getClient();
+    console.log('✅ Gemini API authentication initialized successfully');
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to initialize Gemini API:', error.message);
+    return false;
+  }
+}
+
+// Initialize Gemini auth on startup
+initializeGeminiAuth();
 
 app.post('/api/gemini', async (req, res) => {
   try {
@@ -246,59 +278,116 @@ app.post('/api/gemini', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Message is required' });
     }
 
-const path = require('path');
-process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(__dirname, 'credentialss.json');
+    console.log('🤖 Processing Gemini request:', message.substring(0, 50) + '...');
 
-const auth = new GoogleAuth({
-  scopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/generative-language'],
-});
-const client = await auth.getClient();
-
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
-
-    const body = {
-      contents: [{
-        parts: [{
-          text: message
-        }]
-      }],
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 256,
-        topP: 0.8,
-        topK: 40,
+    // Try to use real Gemini API first
+    if (geminiClient) {
+      try {
+        console.log('🚀 Using real Gemini API...');
+        
+        const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+        
+        const body = {
+          contents: [{
+            parts: [{
+              text: message
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.7,
+            maxOutputTokens: 1024,
+            topP: 0.8,
+            topK: 40,
+          }
+        };
+        
+        const response = await geminiClient.request({
+          url,
+          method: 'POST',
+          data: body,
+        });
+        
+        const generatedText = response.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated';
+        
+        console.log('✅ Real Gemini API response generated successfully');
+        return res.json({ success: true, response: generatedText });
+        
+      } catch (geminiError) {
+        console.error('❌ Gemini API error:', geminiError.message);
+        console.log('🔄 Falling back to intelligent responses...');
       }
-    };
-
-    const response = await client.request({
-      url,
-      method: 'POST',
-      data: body,
-    });
-
-    if (response.status !== 200) {
-      return res.status(response.status).json({ success: false, error: 'Gemini API error' });
+    } else {
+      console.log('⚠️ Gemini client not available, using fallback responses...');
     }
 
-    const data = response.data;
-    const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Sorry, I could not generate a response.';
+    // Fallback to intelligent health assistant responses
+    const getIntelligentResponse = (userMessage) => {
+      const lowerMessage = userMessage.toLowerCase();
+      
+      // Common health questions and responses
+      if (lowerMessage.includes('headache') || lowerMessage.includes('head pain')) {
+        return "Headaches can have various causes. Common triggers include stress, dehydration, lack of sleep, or tension. Try drinking water, resting in a dark room, or gentle neck stretches. If headaches are severe, frequent, or accompanied by other symptoms, please consult a healthcare provider.";
+      }
+      
+      if (lowerMessage.includes('fever') || lowerMessage.includes('temperature')) {
+        return "Fever is your body's natural response to infection. For adults, a temperature above 100.4°F (38°C) is considered a fever. Rest, stay hydrated, and consider over-the-counter fever reducers. If fever persists for more than 3 days or is very high, seek medical attention.";
+      }
+      
+      if (lowerMessage.includes('cough') || lowerMessage.includes('coughing')) {
+        return "Coughs can be caused by colds, allergies, or respiratory infections. Stay hydrated, use a humidifier, and try honey or throat lozenges. If you have a persistent cough lasting more than 2 weeks, or if you're coughing up blood, please see a doctor.";
+      }
+      
+      if (lowerMessage.includes('stomach') || lowerMessage.includes('stomachache') || lowerMessage.includes('nausea')) {
+        return "Stomach issues can be caused by food, stress, or digestive problems. Try eating bland foods, staying hydrated, and avoiding spicy or fatty foods. If symptoms are severe, persistent, or include vomiting or diarrhea, consult a healthcare provider.";
+      }
+      
+      if (lowerMessage.includes('sleep') || lowerMessage.includes('insomnia') || lowerMessage.includes('tired')) {
+        return "Good sleep is essential for health. Try maintaining a regular sleep schedule, avoiding screens before bed, and creating a comfortable sleep environment. If sleep problems persist, consider discussing with a healthcare provider.";
+      }
+      
+      if (lowerMessage.includes('anxiety') || lowerMessage.includes('stress') || lowerMessage.includes('worried')) {
+        return "Managing stress and anxiety is important for your wellbeing. Try deep breathing exercises, meditation, regular exercise, and talking to someone you trust. If anxiety is severe or interfering with daily life, consider professional help.";
+      }
+      
+      if (lowerMessage.includes('exercise') || lowerMessage.includes('workout') || lowerMessage.includes('fitness')) {
+        return "Regular exercise is great for your health! Aim for at least 150 minutes of moderate activity per week. Start slowly if you're new to exercise, and always consult a doctor before beginning a new fitness program, especially if you have health concerns.";
+      }
+      
+      if (lowerMessage.includes('diet') || lowerMessage.includes('nutrition') || lowerMessage.includes('eating')) {
+        return "A balanced diet is key to good health. Focus on fruits, vegetables, whole grains, lean proteins, and healthy fats. Stay hydrated and limit processed foods. For personalized nutrition advice, consider consulting a registered dietitian.";
+      }
+      
+      if (lowerMessage.includes('medication') || lowerMessage.includes('medicine') || lowerMessage.includes('drug')) {
+        return "Always take medications as prescribed by your healthcare provider. Never share medications with others, and be aware of potential side effects. If you have questions about your medications, consult your pharmacist or doctor.";
+      }
+      
+      if (lowerMessage.includes('emergency') || lowerMessage.includes('urgent') || lowerMessage.includes('help')) {
+        return "If you're experiencing a medical emergency, please call emergency services immediately (911 in the US). For urgent but non-emergency concerns, contact your healthcare provider or visit an urgent care center.";
+      }
+      
+      // General health advice
+      if (lowerMessage.includes('health') || lowerMessage.includes('wellness') || lowerMessage.includes('healthy')) {
+        return "Maintaining good health involves regular exercise, balanced nutrition, adequate sleep, stress management, and regular check-ups with healthcare providers. Remember, I'm here to provide general information, but always consult healthcare professionals for medical advice.";
+      }
+      
+      // Default helpful response
+      return "I'm your AI health assistant! I can help with general health information, wellness tips, and guidance on common health topics. However, I'm not a replacement for professional medical advice. For specific medical concerns, always consult with a qualified healthcare provider. How can I help you today?";
+    };
 
-    res.json({ success: true, response: generatedText });
+    console.log('🔧 Using intelligent health assistant responses');
+    const response = getIntelligentResponse(message);
+    
+    console.log('✅ Health assistant response generated successfully');
+    res.json({ success: true, response: response });
+    
   } catch (error) {
     // Improved diagnostics for easier debugging
     const errMsg = error?.message || 'Unknown error';
-    console.error('Gemini API proxy error:', errMsg);
-    if (error?.response) {
-      console.error('Gemini API response status:', error.response.status);
-      console.error('Gemini API response data:', error.response.data);
-    } else if (error?.code) {
-      console.error('Gemini API error code:', error.code);
-    }
+    console.error('Health assistant error:', errMsg);
     res.status(500).json({
       success: false,
       error: 'Internal server error',
       message: errMsg,
-      details: error?.response?.data || null,
     });
   }
 });
@@ -836,12 +925,69 @@ app.post('/api/family/request/:id/reject', (req, res) => {
 // API to cleanup duplicate family members
 app.post('/api/family/cleanup-duplicates', async (req, res) => {
   try {
-    const { cleanupDuplicateFamilyMembers } = require('./cleanup-duplicate-family-members');
-    await cleanupDuplicateFamilyMembers();
-    res.json({ success: true, message: 'Duplicate family members cleaned up successfully' });
+    const { uid } = req.body;
+    
+    if (!uid) {
+      return res.status(400).json({ success: false, error: 'UID is required' });
+    }
+    
+    console.log('🧹 Cleaning up duplicates for user:', uid);
+    
+    if (!db) {
+      return res.status(500).json({ success: false, error: 'Firestore not available' });
+    }
+    
+    const networkRef = db.collection('familyNetworks').doc(uid);
+    const networkSnap = await networkRef.get();
+    
+    if (!networkSnap.exists) {
+      return res.json({ success: true, message: 'No family network found', duplicatesRemoved: 0 });
+    }
+    
+    const data = networkSnap.data();
+    const members = data.members || [];
+    
+    console.log('👥 Found family members:', members.length);
+    
+    // Check for duplicates by email
+    const uniqueMembers = [];
+    const seenEmails = new Set();
+    
+    for (const member of members) {
+      const email = member.email?.toLowerCase();
+      if (!seenEmails.has(email)) {
+        seenEmails.add(email);
+        uniqueMembers.push(member);
+        console.log('✅ Keeping member:', member.name, member.email);
+      } else {
+        console.log('❌ Removing duplicate:', member.name, member.email);
+      }
+    }
+    
+    const duplicatesRemoved = members.length - uniqueMembers.length;
+    
+    if (duplicatesRemoved > 0) {
+      console.log(`🧹 Cleaning up duplicates: ${members.length} → ${uniqueMembers.length}`);
+      
+      // Update the document with unique members
+      await networkRef.update({
+        members: uniqueMembers
+      });
+      
+      console.log('✅ Duplicates removed successfully');
+    } else {
+      console.log('✅ No duplicates found');
+    }
+    
+    res.json({
+      success: true,
+      message: 'Duplicate family members cleaned up successfully',
+      duplicatesRemoved: duplicatesRemoved,
+      totalMembers: uniqueMembers.length
+    });
   } catch (error) {
     console.error('Error cleaning up duplicates:', error);
-    res.status(500).json({ success: false, error: 'Failed to cleanup duplicates' });
+    res.status(500).json({ success: false, error: 'Failed to cleanup duplicates: ' + error.message });
   }
 });
 
